@@ -3,7 +3,7 @@
 
   Hardware:
     - Arduino UNO R3
-    - 1.8" TFT (ST7735, 160x128) mit SD-Kartenleser (SPI)
+    - 1.8" TFT-Shield (ST7735, 160x128) mit SD-Kartenleser (SPI)
     - MPU6050 (Beschleunigung + Gyroskop) an I2C (SDA=A4, SCL=A5)
 
   Ablauf:
@@ -39,8 +39,8 @@
 // Pins und Display
 // ---------------------------------------------------------------------------
 #define TFT_CS   10
-#define TFT_DC    8
-#define TFT_RST   9
+#define TFT_DC    9
+#define TFT_RST   8
 #define SD_CS     4
 
 // Je nach Display-Variante INITR_BLACKTAB, INITR_GREENTAB oder INITR_REDTAB

@@ -28,8 +28,8 @@ damit auch kleinste Vibrationen sichtbar sind.
 | Modul            | Pin        | Arduino UNO |
 |------------------|------------|-------------|
 | TFT              | CS         | D10         |
-| TFT              | A0 / DC    | D8          |
-| TFT              | RESET      | D9          |
+| TFT              | A0 / DC    | D9          |
+| TFT              | RESET      | D8          |
 | TFT + SD         | SDA / MOSI | D11         |
 | TFT + SD         | SCK        | D13         |
 | SD               | MISO       | D12         |
