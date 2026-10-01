@@ -16,6 +16,12 @@
     4. Wird der Arduino angehoben, verschwindet das Bild und das Diagramm wird
        horizontal ueber den ganzen Bildschirm angezeigt. Liegt er wieder ruhig,
        wird die Diashow fortgesetzt.
+    5. Ohne lesbare SD-Karte oder ohne *.BMP-Bilder wird nur das
+       Sensor-Diagramm (Vollbild, horizontal) angezeigt.
+    6. Ueber die serielle Schnittstelle kann ein Bild (140x128, RGB565)
+       empfangen werden, z.B. mit tools/send_image.py. Es wird sofort
+       angezeigt. Optional (SAVE_RECEIVED_IMAGES) wird es zusaetzlich als
+       RCVnnn.BMP auf der SD-Karte gespeichert und ist danach Teil der Diashow.
 
   Bilder:
     Der UNO hat nur 2 KB RAM - zu wenig fuer einen JPEG-Decoder zusaetzlich zur
@@ -88,6 +94,25 @@ const uint16_t CALIB_SAMPLES      = 200;      // 2 s Offset-Messung
 const uint16_t NOISE_SAMPLES      = 100;      // 1 s Ruherauschen messen
 const uint16_t TITLE_TIME_MS      = 3000;
 const uint16_t REST_TIME_MS       = 1500;     // so lange ruhig -> Diashow
+
+// ---------------------------------------------------------------------------
+// Serielle Bilduebertragung
+// ---------------------------------------------------------------------------
+// Protokoll (PC -> Arduino):
+//   Kopf:  'I' 'M' 'G' <Breite> <Hoehe>   (je 1 Byte, muss 140 x 128 sein)
+//   Daten: Breite*Hoehe Pixel RGB565, High-Byte zuerst, zeilenweise von oben
+// Antworten (Arduino -> PC):
+//   'R'  bereit fuer den naechsten Block (SERIAL_BLOCK_PIXELS Pixel)
+//   'D'  Bild vollstaendig empfangen
+//   'E'  Fehler (falsche Groesse oder Zeitueberschreitung)
+// Der PC sendet jeden Block erst nach 'R'. Ein Block ist kleiner als der
+// 64-Byte-Empfangspuffer des UNO, dadurch kann nichts verloren gehen.
+const uint32_t SERIAL_BAUD         = 250000;
+const uint8_t  SERIAL_BLOCK_PIXELS = 30;     // 60 Bytes je Block
+const uint16_t SERIAL_TIMEOUT_MS   = 1000;
+// 1 = empfangene Bilder zusaetzlich als RCVnnn.BMP auf der SD-Karte speichern.
+// Belegt ca. 2,3 KB Flash - der UNO ist damit zu ueber 99 % voll.
+#define SAVE_RECEIVED_IMAGES 0
 
 // ---------------------------------------------------------------------------
 // MPU6050
@@ -181,18 +206,17 @@ uint16_t isqrt(uint32_t n) {
 
 // Zahl rechtsbuendig mit fester Breite ausgeben (ueberschreibt alte Werte)
 void printValue(int32_t v, uint8_t width) {
-  char buf[12];
-  ltoa(v, buf, 10);
-  for (uint8_t n = strlen(buf); n < width; n++) tft.print(' ');
-  tft.print(buf);
+  uint8_t len = v < 0 ? 2 : 1;
+  for (int32_t t = v / 10; t != 0; t /= 10) len++;
+  for (; len < width; len++) tft.print(' ');
+  tft.print(v);
 }
 
+// Standardschrift: 6 px je Zeichen und Textgroesse
 void printCentered(const __FlashStringHelper *text, int16_t y, uint8_t size, uint16_t color) {
-  int16_t x1, y1;
-  uint16_t w, h;
+  int16_t w = strlen_P((const char *)text) * 6 * size;
   tft.setTextSize(size);
-  tft.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-  tft.setCursor((SCREEN_W - (int16_t)w) / 2, y);
+  tft.setCursor((SCREEN_W - w) / 2, y);
   tft.setTextColor(color);
   tft.print(text);
 }
@@ -336,6 +360,11 @@ void drawLiftedLayout() {
 // ---------------------------------------------------------------------------
 // Moduswechsel
 // ---------------------------------------------------------------------------
+// Diashow nur, wenn die SD-Karte lesbar ist und Bilder enthaelt
+bool haveSlides() {
+  return sdOk && imageCount > 0;
+}
+
 void enterLifted() {
   mode = MODE_LIFTED;
   tft.fillScreen(ST77XX_BLACK);
@@ -366,6 +395,8 @@ void processSample() {
   }
 
   updateBars(true);
+  if (!haveSlides()) return;   // Nur-Sensor-Anzeige: kein Wechsel zur Diashow
+
   if (activity < restThreshold) {
     if (restCount == 0) {
       restSinceMs = millis();
@@ -599,12 +630,8 @@ void showMessage(const __FlashStringHelper *line1, const __FlashStringHelper *li
 
 void showNextImage() {
   lastSlideMs = millis();
-  if (!sdOk) {
-    showMessage(F("SD-Karte fehlt"), F("oder Fehler"));
-    return;
-  }
-  if (imageCount == 0) {
-    showMessage(F("Keine *.BMP Bilder"), F("auf der SD-Karte"));
+  if (!haveSlides()) {
+    enterLifted();   // ohne Bilder nur die Sensordaten anzeigen
     return;
   }
 
@@ -623,6 +650,153 @@ void showNextImage() {
 }
 
 // ---------------------------------------------------------------------------
+// Serieller Bildempfang
+// ---------------------------------------------------------------------------
+#if SAVE_RECEIVED_IMAGES
+void write16(File &f, uint16_t v) { f.write((uint8_t *)&v, 2); }
+void write32(File &f, uint32_t v) { f.write((uint8_t *)&v, 4); }
+
+const uint32_t BMP_ROW_SIZE = ((uint32_t)IMG_W * 3 + 3) & ~3UL;
+
+// 24-Bit-BMP-Kopf; negative Hoehe = Zeilen von oben nach unten, passend zur
+// Reihenfolge der empfangenen Daten
+void writeBmpHeader(File &f) {
+  uint32_t dataSize = BMP_ROW_SIZE * IMG_H;
+  write16(f, 0x4D42);
+  write32(f, 54 + dataSize);
+  write32(f, 0);
+  write32(f, 54);
+  write32(f, 40);
+  write32(f, IMG_W);
+  write32(f, (uint32_t)(-(int32_t)IMG_H));
+  write16(f, 1);
+  write16(f, 24);
+  write32(f, 0);
+  write32(f, dataSize);
+  write32(f, 2835);
+  write32(f, 2835);
+  write32(f, 0);
+  write32(f, 0);
+}
+
+// Legt die naechste freie Datei RCV000.BMP ... RCV999.BMP an
+File createReceivedFile(char *name) {
+  strcpy_P(name, PSTR("RCV000.BMP"));
+  for (uint16_t i = 0; i < 1000; i++) {
+    name[3] = '0' + i / 100;
+    name[4] = '0' + (i / 10) % 10;
+    name[5] = '0' + i % 10;
+    File f = SD.open(name, O_WRITE | O_CREAT | O_EXCL);   // nur neue Datei
+    if (f) {
+      writeBmpHeader(f);
+      return f;
+    }
+  }
+  return File();
+}
+
+// Schreibt Pixel (RGB565, High-Byte zuerst) als 24-Bit-BGR in die Datei
+void saveBlock(File &f, const uint16_t *block, uint8_t n, uint16_t firstPixel) {
+  for (uint8_t i = 0; i < n; i++) {
+    const uint8_t *c = (const uint8_t *)&block[i];
+    uint8_t r = c[0] >> 3;
+    uint8_t g = ((c[0] & 0x07) << 3) | (c[1] >> 5);
+    uint8_t b = c[1] & 0x1F;
+    uint8_t bgr[3] = {
+      (uint8_t)((b << 3) | (b >> 2)),
+      (uint8_t)((g << 2) | (g >> 4)),
+      (uint8_t)((r << 3) | (r >> 2))
+    };
+    f.write(bgr, 3);
+    if ((firstPixel + i + 1) % IMG_W == 0) {
+      for (uint16_t pad = IMG_W * 3; pad < BMP_ROW_SIZE; pad++) f.write((uint8_t)0);
+    }
+  }
+}
+#endif
+
+// Empfaengt ein Bild blockweise und zeigt es direkt im Bildbereich an.
+// Waehrend des Empfangs werden die Sensorbalken weiter aktualisiert, ein
+// Moduswechsel (Anheben) findet aber erst danach statt.
+void receiveImage() {
+  if (mode != MODE_SLIDESHOW) {
+    mode = MODE_SLIDESHOW;
+    tft.fillScreen(ST77XX_BLACK);
+    resetBars();
+  }
+  liftCount = 0;
+
+#if SAVE_RECEIVED_IMAGES
+  char name[11];
+  File f;
+  if (sdOk) f = createReceivedFile(name);
+#endif
+
+  const uint16_t totalPixels = (uint16_t)IMG_W * IMG_H;
+  uint16_t block[SERIAL_BLOCK_PIXELS];
+  uint16_t p = 0;
+  bool ok = true;
+
+  while (p < totalPixels) {
+    if (sampleSensor()) updateBars(false);
+
+    uint8_t n = totalPixels - p < SERIAL_BLOCK_PIXELS ? totalPixels - p : SERIAL_BLOCK_PIXELS;
+    Serial.write('R');
+    if (Serial.readBytes((uint8_t *)block, n * 2) != (size_t)n * 2) {
+      ok = false;
+      break;
+    }
+
+    // Block kann ueber ein Zeilenende gehen -> je Zeilenstueck ein Fenster
+    tft.startWrite();
+    for (uint8_t i = 0; i < n;) {
+      uint16_t x = (p + i) % IMG_W;
+      uint16_t y = (p + i) / IMG_W;
+      uint16_t rowLeft = IMG_W - x;
+      uint16_t blockLeft = n - i;
+      uint8_t run = blockLeft < rowLeft ? blockLeft : rowLeft;
+      tft.setAddrWindow(IMG_X + x, y, run, 1);
+      tft.writePixels(block + i, run, true, true);
+      i += run;
+    }
+    tft.endWrite();
+
+#if SAVE_RECEIVED_IMAGES
+    if (f) saveBlock(f, block, n, p);
+#endif
+    p += n;
+  }
+
+#if SAVE_RECEIVED_IMAGES
+  if (f) {
+    f.close();
+    if (ok) imageCount++;
+    else SD.remove(name);
+  }
+#endif
+
+  Serial.write(ok ? 'D' : 'E');
+  lastSlideMs = millis();
+  imageRequested = !ok;   // bei Fehler naechstes Bild bzw. Sensoranzeige
+}
+
+// Wartet auf den Kopf 'I' 'M' 'G' <Breite> <Hoehe>
+void checkSerial() {
+  if (!Serial.available()) return;
+  if (Serial.peek() != 'I') {
+    Serial.read();   // alles ausser einem Kopf verwerfen
+    return;
+  }
+  uint8_t header[5];
+  if (Serial.readBytes(header, 5) != 5 || header[1] != 'M' || header[2] != 'G') return;
+  if (header[3] != IMG_W || header[4] != IMG_H) {
+    Serial.write('E');
+    return;
+  }
+  receiveImage();
+}
+
+// ---------------------------------------------------------------------------
 // Setup / Loop
 // ---------------------------------------------------------------------------
 void showTitle() {
@@ -633,17 +807,24 @@ void showTitle() {
 
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(4, 112);
+  tft.setCursor(4, 100);
   if (sdOk) {
     tft.print(imageCount);
     tft.print(F(" Bilder gefunden"));
   } else {
     tft.print(F("SD-Karte nicht gefunden"));
   }
+  if (!haveSlides()) {
+    tft.setCursor(4, 112);
+    tft.print(F("-> nur Sensoranzeige"));
+  }
   waitWithSensor(TITLE_TIME_MS);
 }
 
 void setup() {
+  Serial.begin(SERIAL_BAUD);
+  Serial.setTimeout(SERIAL_TIMEOUT_MS);
+
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
 
@@ -658,14 +839,19 @@ void setup() {
   if (sdOk) imageCount = countImages();
 
   showTitle();
-  enterSlideshow();
+  if (haveSlides()) enterSlideshow();
+  else enterLifted();
+
+  Serial.print(F("TPV READY\n"));   // Signal fuer tools/send_image.py
 }
 
 void loop() {
   serviceSensor();
+  checkSerial();
 
+  // Ohne Diashow-Bilder bleibt ein seriell empfangenes Bild stehen
   if (mode == MODE_SLIDESHOW &&
-      (imageRequested || millis() - lastSlideMs >= SLIDE_INTERVAL_MS)) {
+      (imageRequested || (haveSlides() && millis() - lastSlideMs >= SLIDE_INTERVAL_MS))) {
     imageRequested = false;
     showNextImage();
   }
