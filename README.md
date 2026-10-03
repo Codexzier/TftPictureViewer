@@ -146,3 +146,36 @@ Deshalb sendet `pc_monitor.py` auch Bilder, automatisch in der halben Größe 70
 Die Pixel werden zeilenweise von oben links gesendet. Der PC sendet jeden Block erst
 nach einem `R`. So kann der 64-Byte-Empfangspuffer des UNO nicht überlaufen, auch
 wenn er zwischendurch den Sensor ausliest.
+
+# Classic Real Time Strategie Simulator
+
+Eigener Sketch in `ClassicRealTimeStrategieSimulator/` für dieselbe Hardware
+(Arduino UNO + 1.8" TFT-Shield, MPU6050 und SD-Karte werden nicht benötigt).
+Zwei Parteien kämpfen automatisch gegeneinander:
+
+- **BLAU** startet links, **ROT** rechts, jeweils mit 2 Panzern, 1 Artillerie und
+  5 Soldaten. Jede Einheit ist höchstens 8x8 Pixel groß (7x7 Symbol + Lebensbalken).
+- Hindernisse (grau/grün) werden per Zufall gesetzt. Panzer und Soldaten brauchen
+  freie Sicht, die Artillerie schießt über Hindernisse hinweg.
+- Die Statuszeile zeigt die verbleibenden Einheiten je Partei und die Spielzeit.
+- Hat eine Partei verloren, zeigt das Display 10 s lang den Sieger, die Dauer und für
+  jede Einheit, wie lange sie im Spiel war (`x` = ausgeschieden, `ok` = überlebt).
+  Danach startet eine neue Schlacht mit neuen Zufallspositionen.
+
+| Einheit    | Reichweite | Nachladen | Trefferchance |
+|------------|------------|-----------|---------------|
+| Soldat     | 10 px      | 0,5 s     | 50 %          |
+| Panzer     | 30 px      | 1,6 s     | 60 %          |
+| Artillerie | 50 px      | 3,0 s     | 40 %          |
+
+Treffer bis zum Ausscheiden:
+
+| Angreifer ↓ / Ziel → | Soldat | Panzer      | Artillerie |
+|----------------------|--------|-------------|------------|
+| Soldat               | 10     | kein Schaden | 10        |
+| Panzer               | 1      | 4           | 2          |
+| Artillerie           | 1      | 4           | 2          |
+
+Soldaten, die nur noch Panzer als Gegner haben, weichen aus. Endet eine Schlacht
+nach 3 Minuten nicht, gewinnt die Partei mit den meisten Lebenspunkten.
+Alle Werte stehen oben im Sketch und lassen sich dort anpassen.
