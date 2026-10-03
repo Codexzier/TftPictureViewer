@@ -20,8 +20,12 @@
        Sensor-Diagramm (Vollbild, horizontal) angezeigt.
     6. Ueber die serielle Schnittstelle kann ein Bild (140x128, RGB565)
        empfangen werden, z.B. mit tools/send_image.py. Es wird sofort
-       angezeigt. Optional (SAVE_RECEIVED_IMAGES) wird es zusaetzlich als
-       RCVnnn.BMP auf der SD-Karte gespeichert und ist danach Teil der Diashow.
+       angezeigt.
+    7. Performance-Modus: Sendet der PC Auslastungsdaten (tools/pc_monitor.py),
+       wird die Diashow auf die halbe Breite (70x128) reduziert. Daneben zeigen
+       4 runde Analog-Anzeigen CPU, GPU, Netzwerk und Festplatte. Das Anheben
+       schaltet in diesem Modus nicht mehr auf das Vollbild-Diagramm um.
+       Kommen 5 s lang keine Daten mehr, geht es normal weiter.
 
   Bilder:
     Der UNO hat nur 2 KB RAM - zu wenig fuer einen JPEG-Decoder zusaetzlich zur
@@ -62,6 +66,29 @@ const int16_t IMG_X   = STRIP_W;
 const int16_t IMG_W   = SCREEN_W - STRIP_W;   // 140
 const int16_t IMG_H   = SCREEN_H;             // 128
 
+// Performance-Modus: Streifen | 4 Rundinstrumente (2x2) | halbes Bild
+const int16_t GAUGE_X0     = STRIP_W;
+const int16_t GAUGE_CELL_W = 35;
+const int16_t GAUGE_CELL_H = 64;
+const int16_t GAUGE_R      = 15;
+const int16_t GAUGE_NEEDLE = 11;
+const int16_t PERF_IMG_X   = GAUGE_X0 + 2 * GAUGE_CELL_W;   // 90
+const int16_t PERF_IMG_W   = SCREEN_W - PERF_IMG_X;         // 70
+const uint16_t GAUGE_FRAME_COLOR = 0x7BEF;                  // grau (Skalenstriche)
+const char GAUGE_LABELS[4][5] = { "CPU", "GPU", "NET", "DISK" };
+const uint8_t GAUGE_NONE = 255;                             // keine Daten
+
+// Zeigerrichtungen fuer 0..100 % in 2,5-%-Schritten auf einer 270-Grad-Skala
+// (cos/sin * 127 in Bildschirmkoordinaten) - spart sin()/cos() im Flash
+const int8_t GAUGE_DIR[41][2] PROGMEM = {
+  {-90,90}, {-100,79}, {-108,66}, {-115,53}, {-121,39}, {-125,25}, {-127,10},
+  {-127,-5}, {-125,-20}, {-122,-34}, {-117,-49}, {-111,-62}, {-103,-75}, {-93,-86},
+  {-82,-97}, {-71,-106}, {-58,-113}, {-44,-119}, {-30,-123}, {-15,-126}, {0,-127},
+  {15,-126}, {30,-123}, {44,-119}, {58,-113}, {71,-106}, {82,-97}, {93,-86},
+  {103,-75}, {111,-62}, {117,-49}, {122,-34}, {125,-20}, {127,-5}, {127,10},
+  {125,25}, {121,39}, {115,53}, {108,66}, {100,79}, {90,90}
+};
+
 // Vertikale Balken im Streifen: 6 Balken, je 2 px breit, 1 px Abstand
 const int16_t V_BAR_X0    = 1;
 const int16_t V_BAR_PITCH = 3;
@@ -99,8 +126,11 @@ const uint16_t REST_TIME_MS       = 1500;     // so lange ruhig -> Diashow
 // Serielle Bilduebertragung
 // ---------------------------------------------------------------------------
 // Protokoll (PC -> Arduino):
-//   Kopf:  'I' 'M' 'G' <Breite> <Hoehe>   (je 1 Byte, muss 140 x 128 sein)
+//   Kopf:  'I' 'M' 'G' <Breite> <Hoehe>   (je 1 Byte, 140 x 128 bzw. im
+//          Performance-Modus 70 x 128)
 //   Daten: Breite*Hoehe Pixel RGB565, High-Byte zuerst, zeilenweise von oben
+//   Leistungsdaten: 'P' 'R' 'F' <CPU> <GPU> <NET> <DISK>  (0..100 %,
+//          255 = nicht verfuegbar), keine Antwort
 // Antworten (Arduino -> PC):
 //   'R'  bereit fuer den naechsten Block (SERIAL_BLOCK_PIXELS Pixel)
 //   'D'  Bild vollstaendig empfangen
@@ -110,9 +140,7 @@ const uint16_t REST_TIME_MS       = 1500;     // so lange ruhig -> Diashow
 const uint32_t SERIAL_BAUD         = 250000;
 const uint8_t  SERIAL_BLOCK_PIXELS = 30;     // 60 Bytes je Block
 const uint16_t SERIAL_TIMEOUT_MS   = 1000;
-// 1 = empfangene Bilder zusaetzlich als RCVnnn.BMP auf der SD-Karte speichern.
-// Belegt ca. 2,3 KB Flash - der UNO ist damit zu ueber 99 % voll.
-#define SAVE_RECEIVED_IMAGES 0
+const uint16_t PERF_TIMEOUT_MS     = 5000;   // ohne Daten -> Performance-Modus aus
 
 // ---------------------------------------------------------------------------
 // MPU6050
@@ -179,6 +207,15 @@ uint16_t imageCount = 0;
 int16_t  lastImageIndex = -1;
 bool     imageRequested = false;
 uint32_t lastSlideMs = 0;
+uint16_t rngState = 1;
+
+// Aktueller Bildbereich (voll bzw. halb im Performance-Modus)
+int16_t  imgX = IMG_X;
+int16_t  imgW = IMG_W;
+
+bool     perfActive = false;
+uint32_t lastPerfMs = 0;
+uint8_t  gaugeValue[4];   // aktuell angezeigter Wert je Instrument
 
 // ---------------------------------------------------------------------------
 // Hilfsfunktionen
@@ -202,6 +239,14 @@ uint16_t isqrt(uint32_t n) {
     bit >>= 2;
   }
   return res;
+}
+
+// Kleiner Zufallsgenerator (Xorshift16) - deutlich kleiner als random()
+uint16_t randomBelow(uint16_t n) {
+  rngState ^= rngState << 7;
+  rngState ^= rngState >> 9;
+  rngState ^= rngState << 8;
+  return rngState % n;
 }
 
 // Zahl rechtsbuendig mit fester Breite ausgeben (ueberschreibt alte Werte)
@@ -386,6 +431,7 @@ void enterSlideshow() {
 void processSample() {
   if (mode == MODE_SLIDESHOW) {
     updateBars(false);
+    if (perfActive) return;   // Performance-Modus: kein Umschalten beim Anheben
     if (activity > liftThreshold || tilt() > TILT_THRESHOLD) {
       if (++liftCount >= LIFT_CONFIRM) enterLifted();
     } else {
@@ -464,7 +510,7 @@ void calibrate() {
     if (n % 10 == 0) drawAxisValues(raw, NULL, 46);
   }
   for (uint8_t ch = 0; ch < 6; ch++) offset[ch] = sum[ch] / (int32_t)CALIB_SAMPLES;
-  randomSeed(seed);
+  rngState = seed ? seed : 1;
 
   drawAxisValues(offset, NULL, 46);
   tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
@@ -573,14 +619,14 @@ bool loadBmp(const char *name) {
   if (h < 0) h = -h;
   uint32_t rowSize = ((uint32_t)w * 3 + 3) & ~3UL;
 
-  int16_t dw = w < IMG_W ? w : IMG_W;
+  int16_t dw = w < imgW ? w : imgW;
   int16_t dh = h < IMG_H ? h : IMG_H;
-  int16_t x0 = IMG_X + (IMG_W - dw) / 2;
+  int16_t x0 = imgX + (imgW - dw) / 2;
   int16_t y0 = (IMG_H - dh) / 2;
   uint16_t cropX = (w - dw) / 2;
   uint16_t cropY = (h - dh) / 2;
 
-  if (dw < IMG_W || dh < IMG_H) tft.fillRect(IMG_X, 0, IMG_W, IMG_H, ST77XX_BLACK);
+  if (dw < imgW || dh < IMG_H) tft.fillRect(imgX, 0, imgW, IMG_H, ST77XX_BLACK);
 
   uint8_t  sdBuf[CHUNK_PIXELS * 3];
   uint16_t pixels[CHUNK_PIXELS];
@@ -619,32 +665,33 @@ bool loadBmp(const char *name) {
 }
 
 void showMessage(const __FlashStringHelper *line1, const __FlashStringHelper *line2) {
-  tft.fillRect(IMG_X, 0, IMG_W, IMG_H, ST77XX_BLACK);
+  tft.fillRect(imgX, 0, imgW, IMG_H, ST77XX_BLACK);
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(IMG_X + 6, 54);
+  tft.setCursor(imgX + 6, 54);
   tft.print(line1);
-  tft.setCursor(IMG_X + 6, 66);
+  tft.setCursor(imgX + 6, 66);
   tft.print(line2);
 }
 
 void showNextImage() {
   lastSlideMs = millis();
   if (!haveSlides()) {
-    enterLifted();   // ohne Bilder nur die Sensordaten anzeigen
+    if (perfActive) showMessage(F("Keine"), F("Bilder"));
+    else enterLifted();   // ohne Bilder nur die Sensordaten anzeigen
     return;
   }
 
-  int16_t index = random(imageCount);
+  int16_t index = randomBelow(imageCount);
   if (imageCount > 1 && index == lastImageIndex) {
-    index = (index + 1 + random(imageCount - 1)) % imageCount;
+    index = (index + 1 + randomBelow(imageCount - 1)) % imageCount;
   }
   lastImageIndex = index;
 
   char name[13];
   if (!imageNameAt(index, name)) return;
   if (!loadBmp(name) && mode == MODE_SLIDESHOW) {
-    showMessage(F("Bild ungueltig:"), F("nur 24-Bit-BMP"));
+    showMessage(F("Bild nicht"), F("lesbar"));
   }
   lastSlideMs = millis();   // 30 s ab fertig angezeigtem Bild
 }
@@ -652,69 +699,6 @@ void showNextImage() {
 // ---------------------------------------------------------------------------
 // Serieller Bildempfang
 // ---------------------------------------------------------------------------
-#if SAVE_RECEIVED_IMAGES
-void write16(File &f, uint16_t v) { f.write((uint8_t *)&v, 2); }
-void write32(File &f, uint32_t v) { f.write((uint8_t *)&v, 4); }
-
-const uint32_t BMP_ROW_SIZE = ((uint32_t)IMG_W * 3 + 3) & ~3UL;
-
-// 24-Bit-BMP-Kopf; negative Hoehe = Zeilen von oben nach unten, passend zur
-// Reihenfolge der empfangenen Daten
-void writeBmpHeader(File &f) {
-  uint32_t dataSize = BMP_ROW_SIZE * IMG_H;
-  write16(f, 0x4D42);
-  write32(f, 54 + dataSize);
-  write32(f, 0);
-  write32(f, 54);
-  write32(f, 40);
-  write32(f, IMG_W);
-  write32(f, (uint32_t)(-(int32_t)IMG_H));
-  write16(f, 1);
-  write16(f, 24);
-  write32(f, 0);
-  write32(f, dataSize);
-  write32(f, 2835);
-  write32(f, 2835);
-  write32(f, 0);
-  write32(f, 0);
-}
-
-// Legt die naechste freie Datei RCV000.BMP ... RCV999.BMP an
-File createReceivedFile(char *name) {
-  strcpy_P(name, PSTR("RCV000.BMP"));
-  for (uint16_t i = 0; i < 1000; i++) {
-    name[3] = '0' + i / 100;
-    name[4] = '0' + (i / 10) % 10;
-    name[5] = '0' + i % 10;
-    File f = SD.open(name, O_WRITE | O_CREAT | O_EXCL);   // nur neue Datei
-    if (f) {
-      writeBmpHeader(f);
-      return f;
-    }
-  }
-  return File();
-}
-
-// Schreibt Pixel (RGB565, High-Byte zuerst) als 24-Bit-BGR in die Datei
-void saveBlock(File &f, const uint16_t *block, uint8_t n, uint16_t firstPixel) {
-  for (uint8_t i = 0; i < n; i++) {
-    const uint8_t *c = (const uint8_t *)&block[i];
-    uint8_t r = c[0] >> 3;
-    uint8_t g = ((c[0] & 0x07) << 3) | (c[1] >> 5);
-    uint8_t b = c[1] & 0x1F;
-    uint8_t bgr[3] = {
-      (uint8_t)((b << 3) | (b >> 2)),
-      (uint8_t)((g << 2) | (g >> 4)),
-      (uint8_t)((r << 3) | (r >> 2))
-    };
-    f.write(bgr, 3);
-    if ((firstPixel + i + 1) % IMG_W == 0) {
-      for (uint16_t pad = IMG_W * 3; pad < BMP_ROW_SIZE; pad++) f.write((uint8_t)0);
-    }
-  }
-}
-#endif
-
 // Empfaengt ein Bild blockweise und zeigt es direkt im Bildbereich an.
 // Waehrend des Empfangs werden die Sensorbalken weiter aktualisiert, ein
 // Moduswechsel (Anheben) findet aber erst danach statt.
@@ -726,13 +710,7 @@ void receiveImage() {
   }
   liftCount = 0;
 
-#if SAVE_RECEIVED_IMAGES
-  char name[11];
-  File f;
-  if (sdOk) f = createReceivedFile(name);
-#endif
-
-  const uint16_t totalPixels = (uint16_t)IMG_W * IMG_H;
+  const uint16_t totalPixels = (uint16_t)imgW * IMG_H;
   uint16_t block[SERIAL_BLOCK_PIXELS];
   uint16_t p = 0;
   bool ok = true;
@@ -750,46 +728,150 @@ void receiveImage() {
     // Block kann ueber ein Zeilenende gehen -> je Zeilenstueck ein Fenster
     tft.startWrite();
     for (uint8_t i = 0; i < n;) {
-      uint16_t x = (p + i) % IMG_W;
-      uint16_t y = (p + i) / IMG_W;
-      uint16_t rowLeft = IMG_W - x;
+      uint16_t x = (p + i) % imgW;
+      uint16_t y = (p + i) / imgW;
+      uint16_t rowLeft = imgW - x;
       uint16_t blockLeft = n - i;
       uint8_t run = blockLeft < rowLeft ? blockLeft : rowLeft;
-      tft.setAddrWindow(IMG_X + x, y, run, 1);
+      tft.setAddrWindow(imgX + x, y, run, 1);
       tft.writePixels(block + i, run, true, true);
       i += run;
     }
     tft.endWrite();
-
-#if SAVE_RECEIVED_IMAGES
-    if (f) saveBlock(f, block, n, p);
-#endif
     p += n;
   }
-
-#if SAVE_RECEIVED_IMAGES
-  if (f) {
-    f.close();
-    if (ok) imageCount++;
-    else SD.remove(name);
-  }
-#endif
 
   Serial.write(ok ? 'D' : 'E');
   lastSlideMs = millis();
   imageRequested = !ok;   // bei Fehler naechstes Bild bzw. Sensoranzeige
 }
 
-// Wartet auf den Kopf 'I' 'M' 'G' <Breite> <Hoehe>
+// ---------------------------------------------------------------------------
+// Performance-Modus: Rundinstrumente fuer CPU, GPU, Netzwerk, Festplatte
+// ---------------------------------------------------------------------------
+void gaugeCenter(uint8_t i, int16_t &cx, int16_t &cy) {
+  cx = GAUGE_X0 + (i % 2) * GAUGE_CELL_W + GAUGE_CELL_W / 2;
+  cy = (i / 2) * GAUGE_CELL_H + 30;
+}
+
+// Punkt auf der Skala: Richtung step (0..40 = 0..100 %), Abstand r
+void gaugePoint(int16_t cx, int16_t cy, uint8_t step, int16_t r, int16_t &x, int16_t &y) {
+  x = cx + (int8_t)pgm_read_byte(&GAUGE_DIR[step][0]) * r / 127;
+  y = cy + (int8_t)pgm_read_byte(&GAUGE_DIR[step][1]) * r / 127;
+}
+
+// Linie in Richtung step vom Radius r0 bis r1 (Zeiger, Skalenstriche)
+void gaugeLine(int16_t cx, int16_t cy, uint8_t step, int16_t r0, int16_t r1, uint16_t color) {
+  int16_t x0, y0, x1, y1;
+  gaugePoint(cx, cy, step, r0, x0, y0);
+  gaugePoint(cx, cy, step, r1, x1, y1);
+  tft.drawLine(x0, y0, x1, y1, color);
+}
+
+uint8_t gaugeStep(uint8_t value) {
+  return ((uint16_t)value * 40 + 50) / 100;
+}
+
+uint16_t loadColor(uint8_t value) {
+  if (value < 60) return ST77XX_GREEN;
+  if (value < 85) return ST77XX_YELLOW;
+  return ST77XX_RED;
+}
+
+void drawGaugeFrames() {
+  tft.setTextSize(1);
+  for (uint8_t i = 0; i < 4; i++) {
+    int16_t cx, cy;
+    gaugeCenter(i, cx, cy);
+    // Runder Skalenbogen (270 Grad) mit Farbzonen gruen / gelb / rot
+    for (uint8_t step = 0; step < 40; step++) {
+      int16_t x0, y0, x1, y1;
+      gaugePoint(cx, cy, step, GAUGE_R, x0, y0);
+      gaugePoint(cx, cy, step + 1, GAUGE_R, x1, y1);
+      tft.drawLine(x0, y0, x1, y1, loadColor(step * 5 / 2));
+    }
+    for (uint8_t step = 0; step <= 40; step += 10) {   // 0/25/50/75/100 %
+      gaugeLine(cx, cy, step, GAUGE_R - 4, GAUGE_R - 1, GAUGE_FRAME_COLOR);
+    }
+    tft.fillRect(cx - 1, cy - 1, 3, 3, ST77XX_WHITE);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(cx - strlen(GAUGE_LABELS[i]) * 3, cy - 27);
+    tft.print(GAUGE_LABELS[i]);
+    tft.setCursor(cx - 12, cy + 20);
+    tft.print(F(" -- "));
+    gaugeValue[i] = GAUGE_NONE;
+  }
+}
+
+void updateGauge(uint8_t i, uint8_t value) {
+  if (value > 100 && value != GAUGE_NONE) value = 100;
+  uint8_t old = gaugeValue[i];
+  if (old == value) return;
+
+  int16_t cx, cy;
+  gaugeCenter(i, cx, cy);
+  if (old != GAUGE_NONE) gaugeLine(cx, cy, gaugeStep(old), 0, GAUGE_NEEDLE, ST77XX_BLACK);
+  if (value != GAUGE_NONE) gaugeLine(cx, cy, gaugeStep(value), 0, GAUGE_NEEDLE, ST77XX_WHITE);
+  tft.fillRect(cx - 1, cy - 1, 3, 3, ST77XX_WHITE);   // Zeigerachse
+
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(cx - 12, cy + 20);
+  if (value == GAUGE_NONE) {
+    tft.print(F(" -- "));
+  } else {
+    printValue(value, 3);
+    tft.print('%');
+  }
+  gaugeValue[i] = value;
+}
+
+void setImageArea(int16_t x, int16_t w) {
+  imgX = x;
+  imgW = w;
+}
+
+void enterPerf() {
+  perfActive = true;
+  setImageArea(PERF_IMG_X, PERF_IMG_W);
+  mode = MODE_SLIDESHOW;
+  tft.fillScreen(ST77XX_BLACK);
+  resetBars();
+  drawGaugeFrames();
+  liftCount = 0;
+  imageRequested = true;
+}
+
+void leavePerf() {
+  perfActive = false;
+  setImageArea(IMG_X, IMG_W);
+  if (haveSlides()) enterSlideshow();
+  else enterLifted();
+}
+
+// 'P' 'R' 'F' <CPU> <GPU> <NET> <DISK>
+void receivePerf() {
+  uint8_t packet[7];
+  if (Serial.readBytes(packet, 7) != 7 || packet[1] != 'R' || packet[2] != 'F') return;
+  lastPerfMs = millis();
+  if (!perfActive) enterPerf();
+  for (uint8_t i = 0; i < 4; i++) updateGauge(i, packet[3 + i]);
+}
+
+// Wartet auf einen Bildkopf 'I' 'M' 'G' <Breite> <Hoehe> oder Leistungsdaten
 void checkSerial() {
   if (!Serial.available()) return;
-  if (Serial.peek() != 'I') {
-    Serial.read();   // alles ausser einem Kopf verwerfen
+  uint8_t c = Serial.peek();
+  if (c == 'P') {
+    receivePerf();
+    return;
+  }
+  if (c != 'I') {
+    Serial.read();   // alles andere verwerfen
     return;
   }
   uint8_t header[5];
   if (Serial.readBytes(header, 5) != 5 || header[1] != 'M' || header[2] != 'G') return;
-  if (header[3] != IMG_W || header[4] != IMG_H) {
+  if (header[3] != imgW || header[4] != IMG_H) {
     Serial.write('E');
     return;
   }
@@ -830,6 +912,7 @@ void setup() {
 
   tft.initR(TFT_TAB);
   tft.setRotation(TFT_ROTATION);
+  tft.setTextWrap(false);
   tft.fillScreen(ST77XX_BLACK);
 
   sensorOk = mpuInit();
@@ -842,12 +925,15 @@ void setup() {
   if (haveSlides()) enterSlideshow();
   else enterLifted();
 
-  Serial.print(F("TPV READY\n"));   // Signal fuer tools/send_image.py
+  while (Serial.available()) Serial.read();   // waehrend des Starts Empfangenes verwerfen
+  Serial.print(F("TPV READY\n"));            // Signal fuer die PC-Tools
 }
 
 void loop() {
   serviceSensor();
   checkSerial();
+
+  if (perfActive && millis() - lastPerfMs >= PERF_TIMEOUT_MS) leavePerf();
 
   // Ohne Diashow-Bilder bleibt ein seriell empfangenes Bild stehen
   if (mode == MODE_SLIDESHOW &&

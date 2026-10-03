@@ -22,6 +22,10 @@ visualisiert dabei die 6 Achsen eines MPU6050 (Beschleunigung + Drehrate).
    darauf, wird dauerhaft nur das horizontale Sensor-Diagramm angezeigt.
 6. **Bild über USB/seriell:** Ein Bild kann vom PC gesendet werden
    (siehe [Bild seriell senden](#bild-seriell-senden)).
+7. **Performance-Modus:** Sendet der PC Leistungsdaten (`tools/pc_monitor.py`),
+   wird die Diashow auf die halbe Breite reduziert. Daneben zeigen 4 runde
+   Analog-Anzeigen CPU, GPU, Netzwerk und Festplatte
+   (siehe [Leistungsdaten vom PC](#leistungsdaten-vom-pc)).
 
 Der Sensor ist auf maximale Empfindlichkeit eingestellt (±2 g, ±250 °/s,
 Tiefpass ~94 Hz, 100 Hz Abtastung). Die Balken verwenden eine Wurzelkennlinie,
@@ -82,16 +86,59 @@ Das empfangene Bild wird sofort angezeigt. Mit SD-Bildern geht die Diashow nach
 30 s normal weiter; ohne SD-Bilder bleibt das Bild stehen, bis der Arduino
 angehoben wird.
 
-Mit `#define SAVE_RECEIVED_IMAGES 1` im Sketch werden empfangene Bilder zusätzlich
-als `RCVnnn.BMP` auf der SD-Karte gespeichert und sind danach Teil der Diashow.
-Das belegt ca. 2,3 KB Flash, der UNO ist damit zu über 99 % voll – deshalb ist es
-standardmäßig aus.
+Läuft `pc_monitor.py`, belegt es den Port – Bilder dann dort senden (siehe unten).
 
-### Protokoll
+## Leistungsdaten vom PC
+
+`tools/pc_monitor.py` misst jede Sekunde die Auslastung und sendet sie an den Arduino:
+
+```sh
+pip install pyserial Pillow psutil
+python3 tools/pc_monitor.py COM3
+python3 tools/pc_monitor.py COM3 --image-dir bilder/ --net-max 250
+```
+
+Solange Daten ankommen, sieht das Display so aus:
+
+| Streifen (20 px) | 4 Rundinstrumente (70 px)  | Diashow (70 px)            |
+|------------------|----------------------------|----------------------------|
+| 6 Messbalken     | CPU, GPU / NET, DISK (2x2) | Bildmitte, 70x128 Pixel    |
+
+- Die Instrumente haben eine 270°-Skala mit Farbzonen (grün bis 60 %, gelb bis
+  85 %, rot darüber), einen Zeiger und den Wert in Prozent.
+- Das Anheben schaltet in diesem Modus **nicht** auf das Vollbild-Diagramm um,
+  die Messbalken im Streifen laufen weiter.
+- Die SD-Bilder (140x128) werden auf die mittleren 70 Spalten beschnitten.
+- Kommen 5 s lang keine Leistungsdaten mehr (Programm beendet), schaltet der
+  Arduino zurück in den normalen Betrieb.
+
+| Instrument | Bedeutung                                                         |
+|------------|-------------------------------------------------------------------|
+| CPU        | Auslastung aller Kerne                                            |
+| GPU        | Auslastung, siehe unten; ohne Quelle zeigt das Instrument `--`    |
+| NET        | Datenrate (senden + empfangen) in % von `--net-max` (Standard 100 Mbit/s) |
+| DISK       | Aktivzeit des am stärksten belasteten Laufwerks                   |
+
+GPU-Quellen (die erste verfügbare wird verwendet):
+
+- NVIDIA: `pip install nvidia-ml-py` oder `nvidia-smi` im Pfad
+- AMD unter Linux: `/sys/class/drm/card*/device/gpu_busy_percent`
+- Windows 10/11, alle Hersteller: Leistungsindikator „GPU Engine“ (3D)
+
+**Bilder senden:** Der serielle Port kann nur von einem Programm geöffnet werden.
+Deshalb sendet `pc_monitor.py` auch Bilder, automatisch in der halben Größe 70x128:
+
+- `--image foto.jpg` sendet ein Bild beim Start,
+- `--image-dir ORDNER` sendet alle `--image-interval` Sekunden (Standard 30) ein
+  zufälliges Bild aus dem Ordner,
+- während des Betriebs einen Dateipfad eintippen und Enter drücken.
+
+## Protokoll
 
 | Richtung       | Daten                                                         |
 |----------------|---------------------------------------------------------------|
-| PC → Arduino   | Kopf: `'I' 'M' 'G' <Breite=140> <Höhe=128>` (je 1 Byte)        |
+| PC → Arduino   | Leistungsdaten: `'P' 'R' 'F' <CPU> <GPU> <NET> <DISK>` (0–100 %, 255 = nicht verfügbar), keine Antwort |
+| PC → Arduino   | Bildkopf: `'I' 'M' 'G' <Breite> <Höhe>` (je 1 Byte): 140x128, im Performance-Modus 70x128 |
 | Arduino → PC   | `R` = bereit für den nächsten Block                           |
 | PC → Arduino   | Block mit 30 Pixeln (60 Bytes), RGB565, High-Byte zuerst      |
 | Arduino → PC   | `D` = Bild vollständig, `E` = Fehler (Größe / Zeitüberschreitung) |
