@@ -179,3 +179,22 @@ Treffer bis zum Ausscheiden:
 Soldaten, die nur noch Panzer als Gegner haben, weichen aus. Endet eine Schlacht
 nach 3 Minuten nicht, gewinnt die Partei mit den meisten Lebenspunkten.
 Alle Werte stehen oben im Sketch und lassen sich dort anpassen.
+
+# Ant Simulation
+
+Eigener Sketch in `AntSimulation/` für dieselbe Hardware (Arduino UNO + 1.8" TFT-Shield):
+
+- Grüne Fläche mit einer braunen Ameisenkolonie (Radius 12 px) an zufälliger Stelle.
+- Jede Sekunde schlüpft eine Ameise (1 schwarzer Pixel), höchstens 20 gleichzeitig.
+  Sie läuft geradeaus in eine zufällige Richtung und wählt am Rand eine neue
+  Richtung, mit der sie im Bild bleibt.
+- Zufällig erscheint weißer Zucker (3 px). Die Ameise, die ihn findet, sendet ein
+  Signal im Umkreis von 8 px. Jede Ameise, die es empfängt, kommt zum Zucker und
+  hilft tragen – je mehr Träger, desto schneller wandert der Zucker zur Kolonie
+  (bis 10 Träger).
+- Im Ziel verschwinden Zucker und Träger in der Kolonie, oben rechts steigt der
+  Punktestand. 3 s später erscheint neuer Zucker an einer freien Stelle.
+- Oben links steht die Anzahl der geschlüpften Ameisen. Die Ameisen laufen nur
+  unterhalb dieser Textzeile.
+
+Alle Werte (Geschwindigkeiten, Radien, Zeiten, Farben) stehen oben im Sketch.
