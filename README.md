@@ -196,5 +196,18 @@ Eigener Sketch in `AntSimulation/` für dieselbe Hardware (Arduino UNO + 1.8" TF
   Punktestand. 3 s später erscheint neuer Zucker an einer freien Stelle.
 - Oben links steht die Anzahl der geschlüpften Ameisen. Die Ameisen laufen nur
   unterhalb dieser Textzeile.
+- Die Kolonie ist für umherlaufende Ameisen ein Hindernis: Sie schlüpfen an ihrem Rand
+  und drehen davor ab wie am Bildschirmrand. Nur Zuckerträger gehen hinein.
+
+**Käfer:** 30 s nach dem Start – und 30 s nach jeder Niederlage – erscheint an einem
+zufälligen Bildschirmrand ein blauer Käfer (3 px), der langsam umherläuft.
+
+- Trifft er eine Ameise, hält sie 2 s durch und macht dann 1/10 Schaden. Danach wird
+  sie gefressen – außer ihr Treffer besiegt den Käfer, dann überleben alle Angreifer.
+- Während des Kampfes sendet sie ein Signal im Umkreis von 20 px. Jede Ameise darin
+  läuft zum Käfer und greift mit an (bis 16 gleichzeitig). Der Käfer steht dabei still.
+- Ein besiegter Käfer bringt 3 Punkte.
+- Der Käfer heilt alle 10 s um 1/10. Erreicht er Zucker, frisst er ihn und hat sofort
+  wieder volle Lebensenergie (neuer Zucker nach 3 s).
 
 Alle Werte (Geschwindigkeiten, Radien, Zeiten, Farben) stehen oben im Sketch.
